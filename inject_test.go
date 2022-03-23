@@ -2,9 +2,10 @@ package inject_test
 
 import (
 	"fmt"
-	"github.com/codegangsta/inject"
 	"reflect"
 	"testing"
+
+	"github.com/codegangsta/inject"
 )
 
 type SpecialString interface {
@@ -156,4 +157,57 @@ func TestInjectImplementors(t *testing.T) {
 	injector.Map(g)
 
 	expect(t, injector.Get(inject.InterfaceOf((*fmt.Stringer)(nil))).IsValid(), true)
+}
+
+func Test_Provider(t *testing.T) {
+	injector := inject.New()
+
+	injector.MapProvider(func() string {
+		return "hello, consumer"
+	})
+
+	expect(t, injector.Get(reflect.TypeOf("string")).IsValid(), true)
+	expect(t, injector.Get(reflect.TypeOf(11)).IsValid(), false)
+}
+
+func Test_ProviderMulti(t *testing.T) {
+	injector := inject.New()
+
+	injector.MapProvider(func() (string, int) {
+		return "1", 1
+	})
+
+	expect(t, injector.Get(reflect.TypeOf("string")).IsValid(), true)
+	expect(t, injector.Get(reflect.TypeOf(11)).IsValid(), true)
+}
+
+func Test_ProviderArgumentInjection(t *testing.T) {
+	injector := inject.New()
+
+	injector.MapProvider(func(n int) string {
+		return fmt.Sprintf("%d", n)
+	})
+
+	injector.Map(1)
+	expect(t, injector.Get(reflect.TypeOf("string")).String(), "1")
+
+	injector.Map(2)
+	expect(t, injector.Get(reflect.TypeOf("string")).String(), "2")
+}
+
+func Test_ProviderCascade(t *testing.T) {
+	injector := inject.New()
+
+	injector.Map(1)
+	injector.MapProvider(func(n int) string {
+		return fmt.Sprintf("%d", n)
+	})
+
+	injector2 := inject.New()
+	injector2.SetParent(injector)
+
+	injector2.Map(2)
+
+	expect(t, injector.Get(reflect.TypeOf("string")).String(), "1")
+	expect(t, injector2.Get(reflect.TypeOf("string")).String(), "2")
 }

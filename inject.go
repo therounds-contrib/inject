@@ -43,17 +43,73 @@ type TypeMapper interface {
 	// This is really only useful for mapping a value as an interface, as interfaces
 	// cannot at this time be referenced directly without a pointer.
 	MapTo(interface{}, interface{}) TypeMapper
+	// Maps the interface{} function as a provider of its return types. This
+	// includes error returns, so the provider must either not fail or panic on
+	// error. The provider will be invoked by Invoker.Invoke, so it may have
+	// any number of arguments of injectable types. Injector failure will
+	// result in panic.
+	//
+	// Values returned by the provider will not be cached: the provider will be
+	// called every time a value of one of its provided types is required. This
+	// is to enable predictable variable output based on other mapped values
+	// (e.g., a service provider function which injects the context of the
+	// current request into the service).
+	//
+	// You must be careful to not construct circular dependencies when defining
+	// providers. For example, a provider of type A which takes an argument of
+	// type B, and a provider of type B which takes an argument of type A.
+	// Attempting to retrieve either type A or B from the mapper will result in
+	// an infinite loop.
+	MapProvider(interface{}) TypeMapper
 	// Provides a possibility to directly insert a mapping based on type and value.
 	// This makes it possible to directly map type arguments not possible to instantiate
 	// with reflect like unidirectional channels.
 	Set(reflect.Type, reflect.Value) TypeMapper
 	// Returns the Value that is mapped to the current type. Returns a zeroed Value if
 	// the Type has not been mapped.
-	Get(reflect.Type) reflect.Value
+	//
+	// The options permit implementation-specific variations in value retrieval
+	// behaviour. These options may not necessarily be user-facing, and the
+	// function may panic if provided unrecognized/inappropriate options.
+	Get(t reflect.Type, options ...interface{}) reflect.Value
+}
+
+// mappedValue is a value which can be injected via TypeMapper.Get. It may be a
+// static value provided at mapping time, or a dynamic one computed at
+// retrieval time, possibly requiring the injection of other mapped values.
+type mappedValue interface {
+	// Get is called by TypeMapper.Get to retrieve a mapped value for a type.
+	Get(injector Injector) reflect.Value
+}
+
+// literalValue is a reflected value.
+type literalValue reflect.Value
+
+// Get the literal reflected value. The argument is unused.
+func (v literalValue) Get(Injector) reflect.Value {
+	return reflect.Value(v)
+}
+
+// providedValue is a value dynamically retrieved from a provider function.
+type providedValue struct {
+	provider interface{}
+	outIndex int
+}
+
+// Get the value dynamically from the provider function.
+func (v providedValue) Get(i Injector) reflect.Value {
+	values, err := i.Invoke(v.provider)
+	if err != nil {
+		panic(err)
+	}
+	// The index of the type-appropriate return has been populated by
+	// TypeMapper.MapProvider, and interface-appropriateness checking has been
+	// done by TypeMapper.Get. We can just blindly return the right value.
+	return values[v.outIndex]
 }
 
 type injector struct {
-	values map[reflect.Type]reflect.Value
+	values map[reflect.Type]mappedValue
 	parent Injector
 }
 
@@ -76,7 +132,7 @@ func InterfaceOf(value interface{}) reflect.Type {
 // New returns a new Injector.
 func New() Injector {
 	return &injector{
-		values: make(map[reflect.Type]reflect.Value),
+		values: make(map[reflect.Type]mappedValue),
 	}
 }
 
@@ -139,27 +195,90 @@ func (inj *injector) Apply(val interface{}) error {
 // Maps the concrete value of val to its dynamic type using reflect.TypeOf,
 // It returns the TypeMapper registered in.
 func (i *injector) Map(val interface{}) TypeMapper {
-	i.values[reflect.TypeOf(val)] = reflect.ValueOf(val)
+	i.values[reflect.TypeOf(val)] = literalValue(reflect.ValueOf(val))
 	return i
 }
 
 func (i *injector) MapTo(val interface{}, ifacePtr interface{}) TypeMapper {
-	i.values[InterfaceOf(ifacePtr)] = reflect.ValueOf(val)
+	i.values[InterfaceOf(ifacePtr)] = literalValue(reflect.ValueOf(val))
 	return i
+}
+
+func (inj *injector) MapProvider(provider interface{}) TypeMapper {
+	t := reflect.TypeOf(provider)
+
+	// t.NumOut panics if t is not of Kind “Func”.
+	for i := 0; i < t.NumOut(); i++ {
+		inj.values[t.Out(i)] = providedValue{provider, i}
+	}
+
+	return inj
 }
 
 // Maps the given reflect.Type to the given reflect.Value and returns
 // the Typemapper the mapping has been registered in.
 func (i *injector) Set(typ reflect.Type, val reflect.Value) TypeMapper {
-	i.values[typ] = val
+	i.values[typ] = literalValue(val)
 	return i
 }
 
-func (i *injector) Get(t reflect.Type) reflect.Value {
-	val := i.values[t]
+// getConfig is the configuration for a type mapper Get operation.
+type getConfig struct {
+	// youngestInjector is the injector that application code called Get on. We
+	// need to keep track of this so we can pass it into mappedValue.Get. If
+	// injector.Get were to pass the receiver into mappedValue.Get, then as we
+	// traversed parent injectors, we'd progressively limit ourselves to a
+	// smaller and smaller set of injectable values, and fewer and fewer
+	// request-scoped values which value providers might want (e.g.,
+	// context.Context, *http.Request). By hanging onto a reference to the
+	// first injector used, value providers mapped to injectors higher up the
+	// chain can still be invoked with arguments which were mapped to child
+	// injectors:
+	//
+	//     type foo struct{ *http.Request }
+	//     fooProvider := func(req *http.Request) *foo {
+	//         return &foo{req}
+	//     }
+	//
+	//     root := inject.New()
+	//     root.MapProvider(fooProvider)
+	//
+	//     child := inject.New()
+	//     child.SetParent(root)
+	//     if req, err := http.NewRequest(http.MethodGet, "/", nil); err == nil {
+	//          child.Map(req)
+	//     }
+	//
+	//     _, _ = child.Invoke(func(f *foo) {
+	//         // f.Request is the one previously mapped on the child injector,
+	//         // even though the provider for foo was mapped on the root.
+	//     }
+	youngestInjector *injector
+}
 
-	if val.IsValid() {
-		return val
+type getOptionsFunc func(*getConfig)
+
+func withYoungestInjector(i *injector) getOptionsFunc {
+	return func(config *getConfig) {
+		config.youngestInjector = i
+	}
+}
+
+func (i *injector) Get(t reflect.Type, options ...interface{}) reflect.Value {
+	config := &getConfig{
+		youngestInjector: i,
+	}
+	for _, option := range options {
+		switch option := option.(type) {
+		case getOptionsFunc:
+			option(config)
+		default:
+			panic(fmt.Errorf("unrecognized Get option: %v", option))
+		}
+	}
+
+	if val, ok := i.values[t]; ok {
+		return val.Get(config.youngestInjector)
 	}
 
 	// no concrete types found, try to find implementors
@@ -167,19 +286,17 @@ func (i *injector) Get(t reflect.Type) reflect.Value {
 	if t.Kind() == reflect.Interface {
 		for k, v := range i.values {
 			if k.Implements(t) {
-				val = v
-				break
+				return v.Get(config.youngestInjector)
 			}
 		}
 	}
 
 	// Still no type found, try to look it up on the parent
-	if !val.IsValid() && i.parent != nil {
-		val = i.parent.Get(t)
+	if i.parent != nil {
+		return i.parent.Get(t, withYoungestInjector(config.youngestInjector))
 	}
 
-	return val
-
+	return reflect.Value{}
 }
 
 func (i *injector) SetParent(parent Injector) {
